@@ -1,0 +1,669 @@
+/* ══════════════════════════════════════════════════════
+   DSN WIDGET  v2.0  — Game Hub Overlay
+   Einbinden in jedes Spiel: <script src="/widget.js"></script>
+   ══════════════════════════════════════════════════════ */
+
+(function () {
+  'use strict';
+
+  /* ── Konstanten ── */
+  const SUPABASE_URL  = 'https://sigjwzivusuzmhvixtbm.supabase.co';
+  const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNpZ2p3eml2dXN1em1odml4dGJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNTI3MDksImV4cCI6MjA4ODcyODcwOX0.j0yB-NYM5HOkfKVBz24rWMBQNF8w-uEFjX55UGeD30E';
+  const SESSION_KEY   = 'dsn_shared_session';
+  const NOTIF_KEY     = 'dsn_last_notif_seen';
+  const THEME_KEY     = 'dsn_theme';
+
+  /* ── Supabase laden (nur falls noch nicht vorhanden) ── */
+  function loadSupabase(cb) {
+    if (window.supabase) { cb(window.supabase); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.39.3/dist/umd/supabase.min.js';
+    s.onload = () => cb(window.supabase);
+    document.head.appendChild(s);
+  }
+
+  /* ── Crypto (PBKDF2) ── */
+  function genSalt() {
+    const b = new Uint8Array(32);
+    crypto.getRandomValues(b);
+    return Array.from(b).map(x => x.toString(16).padStart(2,'0')).join('');
+  }
+  async function hashPw(pw, saltHex) {
+    const enc  = new TextEncoder();
+    const salt = new Uint8Array(saltHex.match(/.{2}/g).map(h => parseInt(h,16)));
+    const key  = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name:'PBKDF2', hash:'SHA-256', salt, iterations:200000 }, key, 256);
+    return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2,'0')).join('');
+  }
+
+  /* ── Session ── */
+  function getSession() {
+    try { return JSON.parse(localStorage.getItem(SESSION_KEY)); } catch { return null; }
+  }
+  function saveSession(u) {
+    const s = { id:u.id, username:u.username, real_name:u.real_name, grade:u.grade, school:u.school, show_name:u.show_name, created_at:u.created_at };
+    localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+    sessionStorage.setItem('dsn_session', JSON.stringify(s));
+  }
+  function clearSession() {
+    localStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem('dsn_session');
+  }
+  function getDisplay(u) { return u.show_name === false ? 'Privat' : (u.real_name || u.username); }
+
+  /* ── Theme ── */
+  function getTheme()     { return localStorage.getItem(THEME_KEY) || 'dark'; }
+  function applyTheme(t)  {
+    document.documentElement.setAttribute('data-dsn-theme', t);
+    const w = document.getElementById('dsn-widget-root');
+    if (w) w.setAttribute('data-theme', t);
+  }
+  function toggleTheme()  {
+    const t = getTheme() === 'dark' ? 'light' : 'dark';
+    localStorage.setItem(THEME_KEY, t);
+    applyTheme(t);
+    updateThemeBtn();
+  }
+  function updateThemeBtn() {
+    const btn = document.getElementById('dsn-theme-btn');
+    if (btn) btn.textContent = getTheme() === 'dark' ? '☀' : '☾';
+  }
+
+  /* ── Styles injizieren ── */
+  function injectStyles() {
+    if (document.getElementById('dsn-widget-styles')) return;
+    const st = document.createElement('style');
+    st.id = 'dsn-widget-styles';
+    st.textContent = `
+      :root { --dsn-accent:#2563eb; --dsn-admin:#9333ea; --dsn-success:#16a34a; --dsn-danger:#dc2626; --dsn-warn:#d97706; }
+      [data-dsn-theme="dark"]  { --dsn-bg:#0f172a; --dsn-bg2:#1e293b; --dsn-bg3:#334155; --dsn-border:#334155; --dsn-text:#e2e8f0; --dsn-muted:#64748b; --dsn-white:#f8fafc; }
+      [data-dsn-theme="light"] { --dsn-bg:#ffffff; --dsn-bg2:#f1f5f9; --dsn-bg3:#e2e8f0; --dsn-border:#cbd5e1; --dsn-text:#1e293b; --dsn-muted:#94a3b8; --dsn-white:#0f172a; }
+
+      #dsn-widget-root { position:fixed; top:12px; right:12px; z-index:2147483647; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+      #dsn-widget-root * { box-sizing:border-box; margin:0; padding:0; }
+
+      /* Bar */
+      #dsn-bar { display:flex; align-items:center; gap:6px; background:var(--dsn-bg); border:1px solid var(--dsn-border); padding:5px 8px; border-radius:8px; box-shadow:0 4px 24px rgba(0,0,0,.35); }
+      .dsn-bar-btn { background:none; border:1px solid var(--dsn-border); border-radius:6px; color:var(--dsn-muted); cursor:pointer; font-size:13px; width:28px; height:28px; display:flex; align-items:center; justify-content:center; transition:all .15s; flex-shrink:0; }
+      .dsn-bar-btn:hover { border-color:var(--dsn-accent); color:var(--dsn-accent); }
+      .dsn-bar-btn.active { background:var(--dsn-accent); border-color:var(--dsn-accent); color:#fff; }
+      #dsn-user-btn { padding:0 10px; width:auto; font-size:11px; letter-spacing:.5px; gap:5px; max-width:140px; overflow:hidden; }
+      #dsn-user-btn .dsn-dot { width:6px; height:6px; border-radius:50%; background:var(--dsn-success); flex-shrink:0; }
+      #dsn-user-btn .dsn-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--dsn-text); }
+      .dsn-notif-badge { position:absolute; top:-4px; right:-4px; background:var(--dsn-danger); color:#fff; font-size:9px; font-weight:700; min-width:15px; height:15px; border-radius:8px; display:flex; align-items:center; justify-content:center; padding:0 3px; }
+      .dsn-btn-wrap { position:relative; }
+
+      /* Panel */
+      .dsn-panel { display:none; position:absolute; top:42px; right:0; width:320px; background:var(--dsn-bg); border:1px solid var(--dsn-border); border-radius:10px; box-shadow:0 8px 40px rgba(0,0,0,.5); overflow:hidden; max-height:520px; flex-direction:column; }
+      .dsn-panel.open { display:flex; }
+      .dsn-panel-head { padding:10px 14px; border-bottom:1px solid var(--dsn-border); display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+      .dsn-panel-title { font-size:11px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--dsn-muted); }
+      .dsn-panel-body { flex:1; overflow-y:auto; padding:14px; }
+      .dsn-panel-body::-webkit-scrollbar { width:3px; }
+      .dsn-panel-body::-webkit-scrollbar-thumb { background:var(--dsn-border); }
+
+      /* Auth */
+      .dsn-inp { width:100%; background:var(--dsn-bg2); border:1px solid var(--dsn-border); border-radius:6px; color:var(--dsn-text); font-size:13px; padding:8px 10px; outline:none; transition:border-color .15s; }
+      .dsn-inp:focus { border-color:var(--dsn-accent); }
+      .dsn-inp::placeholder { color:var(--dsn-muted); }
+      select.dsn-inp { cursor:pointer; }
+      select.dsn-inp option { background:var(--dsn-bg2); }
+      .dsn-fg { margin-bottom:10px; }
+      .dsn-fl { font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color:var(--dsn-muted); margin-bottom:4px; display:block; }
+      .dsn-btn { width:100%; padding:9px; background:var(--dsn-accent); border:none; border-radius:6px; color:#fff; font-size:12px; font-weight:700; letter-spacing:1px; text-transform:uppercase; cursor:pointer; transition:opacity .15s; margin-top:4px; }
+      .dsn-btn:hover { opacity:.88; }
+      .dsn-btn:disabled { opacity:.45; cursor:not-allowed; }
+      .dsn-btn-ghost { background:transparent; border:1px solid var(--dsn-border); color:var(--dsn-muted); }
+      .dsn-btn-ghost:hover { border-color:var(--dsn-accent); color:var(--dsn-accent); opacity:1; }
+      .dsn-msg { font-size:11px; padding:6px 8px; border-radius:4px; margin-top:6px; display:none; }
+      .dsn-msg.err { background:rgba(220,38,38,.12); color:var(--dsn-danger); border-left:2px solid var(--dsn-danger); display:block; }
+      .dsn-msg.ok  { background:rgba(22,163,74,.12); color:var(--dsn-success); border-left:2px solid var(--dsn-success); display:block; }
+      .dsn-tabs { display:flex; border-bottom:1px solid var(--dsn-border); margin-bottom:14px; }
+      .dsn-tab { flex:1; padding:8px; background:none; border:none; border-bottom:2px solid transparent; color:var(--dsn-muted); font-size:11px; font-weight:700; letter-spacing:1px; text-transform:uppercase; cursor:pointer; transition:all .15s; }
+      .dsn-tab.active { color:var(--dsn-accent); border-bottom-color:var(--dsn-accent); }
+      .dsn-tp { display:none; }
+      .dsn-tp.active { display:block; }
+      .dsn-guest-hint { font-size:11px; color:var(--dsn-muted); text-align:center; margin-top:10px; }
+
+      /* User Info */
+      .dsn-info-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:12px; }
+      .dsn-info-block { background:var(--dsn-bg2); border:1px solid var(--dsn-border); border-radius:6px; padding:8px 10px; }
+      .dsn-info-label { font-size:9px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--dsn-muted); margin-bottom:3px; }
+      .dsn-info-val { font-size:13px; font-weight:600; color:var(--dsn-text); }
+      .dsn-hub-link { display:block; padding:9px; background:var(--dsn-bg2); border:1px solid var(--dsn-border); border-radius:6px; color:var(--dsn-accent); font-size:11px; font-weight:700; letter-spacing:1px; text-transform:uppercase; text-align:center; text-decoration:none; margin-bottom:8px; transition:all .15s; }
+      .dsn-hub-link:hover { background:var(--dsn-accent); color:#fff; }
+
+      /* Chat */
+      #dsn-chat-msgs { display:flex; flex-direction:column; gap:8px; min-height:200px; max-height:300px; overflow-y:auto; margin-bottom:10px; }
+      #dsn-chat-msgs::-webkit-scrollbar { width:3px; }
+      #dsn-chat-msgs::-webkit-scrollbar-thumb { background:var(--dsn-border); }
+      .dsn-chat-msg { background:var(--dsn-bg2); border:1px solid var(--dsn-border); border-radius:8px; padding:8px 10px; }
+      .dsn-chat-msg.own { background:rgba(37,99,235,.12); border-color:rgba(37,99,235,.3); }
+      .dsn-chat-author { font-size:10px; font-weight:700; color:var(--dsn-accent); margin-bottom:2px; }
+      .dsn-chat-text { font-size:13px; color:var(--dsn-text); line-height:1.45; word-break:break-word; }
+      .dsn-chat-time { font-size:10px; color:var(--dsn-muted); margin-top:2px; }
+      .dsn-chat-input-row { display:flex; gap:6px; }
+      .dsn-chat-send { background:var(--dsn-accent); border:none; border-radius:6px; color:#fff; padding:0 12px; font-size:13px; cursor:pointer; flex-shrink:0; transition:opacity .15s; }
+      .dsn-chat-send:hover { opacity:.85; }
+      .dsn-chat-send:disabled { opacity:.4; cursor:not-allowed; }
+      .dsn-chat-gate { font-size:12px; color:var(--dsn-muted); text-align:center; padding:20px 0; }
+
+      /* Score */
+      .dsn-score-row { background:var(--dsn-bg2); border:1px solid var(--dsn-border); border-radius:6px; padding:8px 10px; display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
+      .dsn-score-game { font-size:12px; font-weight:700; color:var(--dsn-text); }
+      .dsn-score-val  { font-size:16px; font-weight:700; color:var(--dsn-accent); }
+      .dsn-score-sub  { font-size:10px; color:var(--dsn-muted); }
+      .dsn-submit-row { display:grid; grid-template-columns:1fr 100px auto; gap:6px; margin-top:10px; align-items:end; }
+
+      /* Notifs */
+      .dsn-notif-item { background:var(--dsn-bg2); border:1px solid var(--dsn-border); border-radius:6px; padding:9px 10px; margin-bottom:6px; }
+      .dsn-notif-item.unread { border-left:3px solid var(--dsn-accent); }
+      .dsn-notif-title { font-size:12px; font-weight:700; color:var(--dsn-text); margin-bottom:2px; }
+      .dsn-notif-body  { font-size:12px; color:var(--dsn-muted); line-height:1.4; }
+      .dsn-notif-time  { font-size:10px; color:var(--dsn-muted); margin-top:3px; }
+
+      /* Spinner */
+      .dsn-spin { display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,.25); border-top-color:currentColor; border-radius:50%; animation:dsn-rotate .7s linear infinite; vertical-align:middle; margin-right:5px; }
+      @keyframes dsn-rotate { to { transform:rotate(360deg); } }
+    `;
+    document.head.appendChild(st);
+  }
+
+  /* ── HTML injizieren ── */
+  function injectHTML() {
+    if (document.getElementById('dsn-widget-root')) return;
+    const root = document.createElement('div');
+    root.id = 'dsn-widget-root';
+    root.setAttribute('data-theme', getTheme());
+    root.innerHTML = `
+      <div id="dsn-bar">
+        <!-- Theme Toggle -->
+        <button class="dsn-bar-btn" id="dsn-theme-btn" title="Theme wechseln" onclick="DSN._toggleTheme()">☀</button>
+        <!-- Hub Link -->
+        <a class="dsn-bar-btn" href="/" title="Zurück zum Hub" style="text-decoration:none;font-size:16px;">🏠</a>
+        <!-- Chat -->
+        <div class="dsn-btn-wrap">
+          <button class="dsn-bar-btn" id="dsn-chat-btn" title="Chat" onclick="DSN._togglePanel('chat')">💬</button>
+          <span class="dsn-notif-badge" id="dsn-chat-badge" style="display:none">0</span>
+        </div>
+        <!-- Notifs -->
+        <div class="dsn-btn-wrap">
+          <button class="dsn-bar-btn" id="dsn-notif-btn" title="Benachrichtigungen" onclick="DSN._togglePanel('notif')">🔔</button>
+          <span class="dsn-notif-badge" id="dsn-notif-badge" style="display:none">0</span>
+        </div>
+        <!-- Score -->
+        <button class="dsn-bar-btn" id="dsn-score-btn" title="Scores" onclick="DSN._togglePanel('score')">🏆</button>
+        <!-- Account -->
+        <button class="dsn-bar-btn" id="dsn-user-btn" onclick="DSN._togglePanel('account')">
+          <span style="font-size:14px">👤</span>
+          <span class="dsn-name" id="dsn-bar-name">LOGIN</span>
+        </button>
+      </div>
+
+      <!-- CHAT PANEL -->
+      <div class="dsn-panel" id="dsn-panel-chat">
+        <div class="dsn-panel-head">
+          <span class="dsn-panel-title">💬 Hub Chat</span>
+          <button class="dsn-bar-btn" onclick="DSN._closePanel('chat')" style="font-size:11px;width:22px;height:22px;">✕</button>
+        </div>
+        <div class="dsn-panel-body" style="display:flex;flex-direction:column;padding:10px;">
+          <div id="dsn-chat-msgs"><div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Lädt…</div></div>
+          <div id="dsn-chat-input-wrap">
+            <div class="dsn-chat-gate" id="dsn-chat-gate">Einloggen um mitzuschreiben →</div>
+            <div class="dsn-chat-input-row" id="dsn-chat-send-row" style="display:none">
+              <input class="dsn-inp" id="dsn-chat-inp" placeholder="Nachricht…" maxlength="200" onkeydown="if(event.key==='Enter')DSN._sendChat()"/>
+              <button class="dsn-chat-send" onclick="DSN._sendChat()" id="dsn-chat-sendbtn">➤</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- NOTIF PANEL -->
+      <div class="dsn-panel" id="dsn-panel-notif">
+        <div class="dsn-panel-head">
+          <span class="dsn-panel-title">🔔 Benachrichtigungen</span>
+          <button class="dsn-bar-btn" onclick="DSN._closePanel('notif')" style="font-size:11px;width:22px;height:22px;">✕</button>
+        </div>
+        <div class="dsn-panel-body" id="dsn-notif-body">
+          <div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Lädt…</div>
+        </div>
+      </div>
+
+      <!-- SCORE PANEL -->
+      <div class="dsn-panel" id="dsn-panel-score">
+        <div class="dsn-panel-head">
+          <span class="dsn-panel-title">🏆 Highscores</span>
+          <button class="dsn-bar-btn" onclick="DSN._closePanel('score')" style="font-size:11px;width:22px;height:22px;">✕</button>
+        </div>
+        <div class="dsn-panel-body" id="dsn-score-body">
+          <div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Lädt…</div>
+        </div>
+      </div>
+
+      <!-- ACCOUNT PANEL -->
+      <div class="dsn-panel" id="dsn-panel-account">
+        <div class="dsn-panel-head">
+          <span class="dsn-panel-title">👤 Account</span>
+          <button class="dsn-bar-btn" onclick="DSN._closePanel('account')" style="font-size:11px;width:22px;height:22px;">✕</button>
+        </div>
+        <div class="dsn-panel-body" id="dsn-account-body">
+          <!-- Auth: Login/Register -->
+          <div id="dsn-auth-section">
+            <div class="dsn-tabs">
+              <button class="dsn-tab active" id="dsn-tab-login" onclick="DSN._switchAuthTab('login')">LOGIN</button>
+              <button class="dsn-tab" id="dsn-tab-reg" onclick="DSN._switchAuthTab('reg')">REGISTRIEREN</button>
+            </div>
+            <div class="dsn-tp active" id="dsn-tp-login">
+              <div class="dsn-fg"><label class="dsn-fl">Username</label><input class="dsn-inp" id="dsn-l-user" type="text" placeholder="dein_username" autocomplete="off"/></div>
+              <div class="dsn-fg"><label class="dsn-fl">Passwort</label><input class="dsn-inp" id="dsn-l-pass" type="password" placeholder="••••••••" onkeydown="if(event.key==='Enter')DSN._login()"/></div>
+              <div class="dsn-msg" id="dsn-l-msg"></div>
+              <button class="dsn-btn" onclick="DSN._login()" id="dsn-l-btn"><span id="dsn-l-btntxt">EINLOGGEN</span></button>
+              <p class="dsn-guest-hint">Kein Account? Einfach als Gast spielen.</p>
+            </div>
+            <div class="dsn-tp" id="dsn-tp-reg">
+              <div class="dsn-fg"><label class="dsn-fl">Username</label><input class="dsn-inp" id="dsn-r-user" type="text" placeholder="shadow_felix" autocomplete="off"/></div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                <div class="dsn-fg"><label class="dsn-fl">Klasse</label>
+                  <select class="dsn-inp" id="dsn-r-grade">
+                    <option value="" disabled selected>— wählen —</option>
+                    <option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option><option value="10">10</option><option value="11">EF</option><option value="12">Q1</option><option value="13">Q2</option>
+                  </select>
+                </div>
+                <div class="dsn-fg"><label class="dsn-fl">Vorname (opt.)</label><input class="dsn-inp" id="dsn-r-name" type="text" placeholder="Felix"/></div>
+              </div>
+              <div class="dsn-fg"><label class="dsn-fl">Schule</label>
+                <select class="dsn-inp" id="dsn-r-school">
+                  <option value="" disabled selected>— wählen —</option>
+                  <option value="Albert Einstein Gymnasium">Albert Einstein Gymnasium</option>
+                  <option value="Andere Schule">Andere Schule</option>
+                </select>
+              </div>
+              <div class="dsn-fg"><label class="dsn-fl">Passwort</label><input class="dsn-inp" id="dsn-r-pass" type="password" placeholder="Mind. 6 Zeichen"/></div>
+              <div class="dsn-msg" id="dsn-r-msg"></div>
+              <button class="dsn-btn" onclick="DSN._register()" id="dsn-r-btn"><span id="dsn-r-btntxt">ACCOUNT ERSTELLEN</span></button>
+            </div>
+          </div>
+          <!-- Dashboard (eingeloggt) -->
+          <div id="dsn-dash-section" style="display:none">
+            <div style="font-size:15px;font-weight:700;color:var(--dsn-text);margin-bottom:2px;">Hi, <span id="dsn-dash-name" style="color:var(--dsn-accent);">–</span>!</div>
+            <div style="font-size:11px;color:var(--dsn-muted);margin-bottom:12px;" id="dsn-dash-sub">Klasse – · AEG</div>
+            <a class="dsn-hub-link" href="/">🏠 Zum Game Hub</a>
+            <div class="dsn-info-grid">
+              <div class="dsn-info-block"><div class="dsn-info-label">Username</div><div class="dsn-info-val" id="dsn-dash-user">–</div></div>
+              <div class="dsn-info-block"><div class="dsn-info-label">Klasse</div><div class="dsn-info-val" id="dsn-dash-grade">–</div></div>
+              <div class="dsn-info-block" style="grid-column:1/-1"><div class="dsn-info-label">Dabei seit</div><div class="dsn-info-val" id="dsn-dash-since">–</div></div>
+            </div>
+            <button class="dsn-btn dsn-btn-ghost" onclick="DSN._logout()" style="width:auto;padding:6px 14px;">Ausloggen</button>
+          </div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(root);
+  }
+
+  /* ── Panel-Logik ── */
+  let openPanel = null;
+  function _togglePanel(name) {
+    if (openPanel === name) { _closePanel(name); return; }
+    if (openPanel) _closePanel(openPanel);
+    const el = document.getElementById('dsn-panel-' + name);
+    if (!el) return;
+    el.classList.add('open');
+    document.getElementById('dsn-' + name + '-btn')?.classList.add('active');
+    openPanel = name;
+    if (name === 'chat')    _loadChat();
+    if (name === 'score')   _loadScores();
+    if (name === 'notif')   _loadNotifs();
+    if (name === 'account') _renderAccount();
+    // Außen-Klick schließt Panel
+    setTimeout(() => {
+      function outside(e) {
+        if (!document.getElementById('dsn-widget-root').contains(e.target)) {
+          _closePanel(name);
+          document.removeEventListener('click', outside);
+        }
+      }
+      document.addEventListener('click', outside);
+    }, 50);
+  }
+  function _closePanel(name) {
+    document.getElementById('dsn-panel-' + name)?.classList.remove('open');
+    document.getElementById('dsn-' + name + '-btn')?.classList.remove('active');
+    if (openPanel === name) openPanel = null;
+  }
+
+  /* ── Auth ── */
+  function _switchAuthTab(t) {
+    ['login','reg'].forEach(x => {
+      document.getElementById('dsn-tab-' + x).classList.toggle('active', x === t);
+      document.getElementById('dsn-tp-' + x).classList.toggle('active', x === t);
+    });
+  }
+  function _setBtn(id, txtId, label, loading) {
+    const btn = document.getElementById(id), txt = document.getElementById(txtId);
+    if (!btn || !txt) return;
+    btn.disabled = loading;
+    txt.innerHTML = loading ? `<span class="dsn-spin"></span>${label}` : label;
+  }
+  function _showMsg(id, text, type) { const el = document.getElementById(id); if (!el) return; el.textContent = text; el.className = 'dsn-msg ' + type; }
+  function _hideMsg(id) { const el = document.getElementById(id); if (!el) return; el.className = 'dsn-msg'; el.textContent = ''; }
+
+  async function _login() {
+    _hideMsg('dsn-l-msg');
+    const user = document.getElementById('dsn-l-user').value.trim().toLowerCase();
+    const pass = document.getElementById('dsn-l-pass').value;
+    if (!user || !pass) { _showMsg('dsn-l-msg', 'Bitte alle Felder ausfüllen.', 'err'); return; }
+    _setBtn('dsn-l-btn', 'dsn-l-btntxt', 'SUCHE…', true);
+    try {
+      const { data: salt } = await _db.rpc('dsn_get_salt', { p_username: user });
+      if (!salt) { _showMsg('dsn-l-msg', 'Username nicht gefunden.', 'err'); return; }
+      const hash = await hashPw(pass, salt);
+      const { data: u } = await _db.rpc('dsn_login', { p_username: user, p_password_hash: hash });
+      if (!u) { _showMsg('dsn-l-msg', 'Falsches Passwort.', 'err'); return; }
+      _currentUser = u; saveSession(u); _onLogin(u);
+    } catch(e) { _showMsg('dsn-l-msg', 'Fehler: ' + e.message, 'err'); }
+    finally { _setBtn('dsn-l-btn', 'dsn-l-btntxt', 'EINLOGGEN', false); }
+  }
+
+  async function _register() {
+    _hideMsg('dsn-r-msg');
+    const user   = document.getElementById('dsn-r-user').value.trim().toLowerCase();
+    const grade  = document.getElementById('dsn-r-grade').value;
+    const name   = document.getElementById('dsn-r-name').value.trim() || user;
+    const school = document.getElementById('dsn-r-school').value;
+    const pass   = document.getElementById('dsn-r-pass').value;
+    if (!user || user.length < 3) { _showMsg('dsn-r-msg', 'Username mind. 3 Zeichen.', 'err'); return; }
+    if (!grade) { _showMsg('dsn-r-msg', 'Bitte Klasse wählen.', 'err'); return; }
+    if (!school) { _showMsg('dsn-r-msg', 'Bitte Schule wählen.', 'err'); return; }
+    if (!pass || pass.length < 6) { _showMsg('dsn-r-msg', 'Passwort mind. 6 Zeichen.', 'err'); return; }
+    _setBtn('dsn-r-btn', 'dsn-r-btntxt', 'PRÜFE…', true);
+    try {
+      const { data: avail } = await _db.rpc('dsn_check_username', { p_username: user });
+      if (!avail) { _showMsg('dsn-r-msg', 'Username vergeben.', 'err'); return; }
+      const salt = genSalt(), password_hash = await hashPw(pass, salt);
+      const { error } = await _db.from('dsn_users').insert([{ username: user, real_name: name, grade, school, salt, password_hash, show_name: true }]);
+      if (error) throw error;
+      _showMsg('dsn-r-msg', '✓ Account erstellt! Bitte einloggen.', 'ok');
+      setTimeout(() => _switchAuthTab('login'), 1500);
+    } catch(e) { _showMsg('dsn-r-msg', 'Fehler: ' + e.message, 'err'); }
+    finally { _setBtn('dsn-r-btn', 'dsn-r-btntxt', 'ACCOUNT ERSTELLEN', false); }
+  }
+
+  function _logout() {
+    clearSession(); _currentUser = null; _onLogout();
+    // Andere Tabs informieren
+    localStorage.setItem('dsn_logout_signal', Date.now());
+    setTimeout(() => localStorage.removeItem('dsn_logout_signal'), 100);
+  }
+
+  function _onLogin(u) {
+    _currentUser = u;
+    // Bar updaten
+    const nameEl = document.getElementById('dsn-bar-name');
+    if (nameEl) { nameEl.textContent = u.username; }
+    const btn = document.getElementById('dsn-user-btn');
+    if (btn) { btn.innerHTML = `<span class="dsn-dot"></span><span class="dsn-name">${_esc(u.username)}</span>`; }
+    _renderAccount();
+    _loadNotifs();
+    _subscribeChat();
+    // Callback für Spiel
+    if (typeof DSN._onLoginCallback === 'function') DSN._onLoginCallback(u);
+  }
+
+  function _onLogout() {
+    const btn = document.getElementById('dsn-user-btn');
+    if (btn) { btn.innerHTML = `<span style="font-size:14px">👤</span><span class="dsn-name">LOGIN</span>`; }
+    _renderAccount();
+    if (typeof DSN._onLogoutCallback === 'function') DSN._onLogoutCallback();
+  }
+
+  function _renderAccount() {
+    const u = _currentUser;
+    const auth  = document.getElementById('dsn-auth-section');
+    const dash  = document.getElementById('dsn-dash-section');
+    if (!auth || !dash) return;
+    if (u) {
+      auth.style.display = 'none'; dash.style.display = 'block';
+      const seit = u.created_at ? new Date(u.created_at).toLocaleDateString('de-DE') : '–';
+      document.getElementById('dsn-dash-name').textContent  = getDisplay(u);
+      document.getElementById('dsn-dash-user').textContent  = u.username || '–';
+      document.getElementById('dsn-dash-grade').textContent = 'Klasse ' + (u.grade || '–');
+      document.getElementById('dsn-dash-since').textContent = seit;
+      document.getElementById('dsn-dash-sub').textContent   = `Klasse ${u.grade || '–'} · ${u.school || '–'}`;
+    } else {
+      auth.style.display = 'block'; dash.style.display = 'none';
+    }
+  }
+
+  /* ── CHAT ── */
+  let _chatSub = null;
+  async function _loadChat() {
+    const msgs = document.getElementById('dsn-chat-msgs');
+    const gate = document.getElementById('dsn-chat-gate');
+    const srow = document.getElementById('dsn-chat-send-row');
+    if (gate) gate.style.display = _currentUser ? 'none' : 'block';
+    if (srow) srow.style.display = _currentUser ? 'flex' : 'none';
+    msgs.innerHTML = '<div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Lädt…</div>';
+    try {
+      const { data } = await _db.from('dsn_chat_messages')
+        .select('*').order('created_at', { ascending: false }).limit(40);
+      _renderChatMsgs((data || []).reverse());
+    } catch(e) {
+      msgs.innerHTML = `<div style="text-align:center;padding:20px;font-size:11px;color:var(--dsn-muted);">Chat-Tabelle fehlt.<br>SQL-Setup ausführen.</div>`;
+    }
+    _subscribeChat();
+  }
+
+  function _renderChatMsgs(msgs) {
+    const el = document.getElementById('dsn-chat-msgs');
+    if (!el) return;
+    if (!msgs.length) { el.innerHTML = '<div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Noch keine Nachrichten.</div>'; return; }
+    el.innerHTML = msgs.map(m => {
+      const own = _currentUser && m.username === _currentUser.username;
+      const t = new Date(m.created_at).toLocaleTimeString('de-DE', { hour:'2-digit', minute:'2-digit' });
+      return `<div class="dsn-chat-msg${own ? ' own' : ''}">
+        <div class="dsn-chat-author">${_esc(m.username)}</div>
+        <div class="dsn-chat-text">${_esc(m.message)}</div>
+        <div class="dsn-chat-time">${t}</div>
+      </div>`;
+    }).join('');
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function _subscribeChat() {
+    if (_chatSub) return;
+    try {
+      _chatSub = _db.channel('dsn-chat-realtime')
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'dsn_chat_messages' }, payload => {
+          const el = document.getElementById('dsn-chat-msgs');
+          if (!el) return;
+          const m = payload.new;
+          const own = _currentUser && m.username === _currentUser.username;
+          const t = new Date(m.created_at).toLocaleTimeString('de-DE', { hour:'2-digit', minute:'2-digit' });
+          const div = document.createElement('div');
+          div.className = 'dsn-chat-msg' + (own ? ' own' : '');
+          div.innerHTML = `<div class="dsn-chat-author">${_esc(m.username)}</div><div class="dsn-chat-text">${_esc(m.message)}</div><div class="dsn-chat-time">${t}</div>`;
+          el.appendChild(div);
+          el.scrollTop = el.scrollHeight;
+          // Badge updaten wenn Panel zu
+          if (openPanel !== 'chat') {
+            const badge = document.getElementById('dsn-chat-badge');
+            if (badge) { badge.style.display = 'flex'; badge.textContent = parseInt(badge.textContent || 0) + 1; }
+          }
+        })
+        .subscribe();
+    } catch(e) { /* Realtime optional */ }
+  }
+
+  async function _sendChat() {
+    if (!_currentUser) return;
+    const inp = document.getElementById('dsn-chat-inp');
+    const msg = (inp?.value || '').trim();
+    if (!msg || msg.length < 1) return;
+    inp.value = '';
+    const btn = document.getElementById('dsn-chat-sendbtn');
+    if (btn) btn.disabled = true;
+    try {
+      await _db.from('dsn_chat_messages').insert({ username: _currentUser.username, message: msg });
+      // Erst nach Realtime-Event oder Fallback
+      const badge = document.getElementById('dsn-chat-badge');
+      if (badge) badge.style.display = 'none';
+    } catch(e) { inp.value = msg; }
+    if (btn) btn.disabled = false;
+  }
+
+  /* ── NOTIFICATIONS ── */
+  async function _loadNotifs() {
+    const body = document.getElementById('dsn-notif-body');
+    if (!body) return;
+    body.innerHTML = '<div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Lädt…</div>';
+    try {
+      const { data } = await _db.from('dsn_notifications')
+        .select('*').order('created_at', { ascending: false }).limit(20);
+      const notifs = data || [];
+      const lastSeen = parseInt(localStorage.getItem(NOTIF_KEY) || '0');
+      const unread = notifs.filter(n => new Date(n.created_at).getTime() > lastSeen).length;
+      const badge = document.getElementById('dsn-notif-badge');
+      if (badge) { badge.style.display = unread > 0 ? 'flex' : 'none'; badge.textContent = unread; }
+      if (!notifs.length) { body.innerHTML = '<div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Keine Benachrichtigungen.</div>'; return; }
+      body.innerHTML = notifs.map(n => {
+        const isUnread = new Date(n.created_at).getTime() > lastSeen;
+        const t = new Date(n.created_at).toLocaleDateString('de-DE');
+        return `<div class="dsn-notif-item${isUnread ? ' unread' : ''}">
+          <div class="dsn-notif-title">${_esc(n.title)}</div>
+          <div class="dsn-notif-body">${_esc(n.body)}</div>
+          <div class="dsn-notif-time">${t}</div>
+        </div>`;
+      }).join('');
+      // Als gelesen markieren
+      localStorage.setItem(NOTIF_KEY, Date.now());
+      setTimeout(() => { if (badge) badge.style.display = 'none'; }, 500);
+    } catch(e) {
+      body.innerHTML = '<div style="text-align:center;padding:20px;font-size:11px;color:var(--dsn-muted);">Notifications-Tabelle fehlt. SQL-Setup ausführen.</div>';
+    }
+  }
+
+  /* ── SCORES ── */
+  async function _loadScores() {
+    const body = document.getElementById('dsn-score-body');
+    if (!body) return;
+    body.innerHTML = '<div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Lädt…</div>';
+    try {
+      // Top-10 pro Spiel
+      const { data } = await _db.from('dsn_scores')
+        .select('*').order('score', { ascending: false }).limit(50);
+      const scores = data || [];
+      if (!scores.length) { body.innerHTML = '<div style="text-align:center;padding:20px;font-size:12px;color:var(--dsn-muted);">Noch keine Scores.</div>'; return; }
+      // Nach Spiel gruppieren
+      const byGame = {};
+      scores.forEach(s => { if (!byGame[s.game_name]) byGame[s.game_name] = []; if (byGame[s.game_name].length < 5) byGame[s.game_name].push(s); });
+      let html = '';
+      for (const [game, list] of Object.entries(byGame)) {
+        html += `<div style="margin-bottom:14px;"><div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--dsn-accent);margin-bottom:6px;">${_esc(game)}</div>`;
+        list.forEach((s, i) => {
+          const own = _currentUser && s.username === _currentUser.username;
+          html += `<div class="dsn-score-row${own ? '" style="border-color:var(--dsn-accent)' : ''}">
+            <div><div class="dsn-score-game">${i+1}. ${_esc(s.username)}</div><div class="dsn-score-sub">${new Date(s.created_at).toLocaleDateString('de-DE')}</div></div>
+            <div class="dsn-score-val">${s.score.toLocaleString()}</div>
+          </div>`;
+        });
+        html += '</div>';
+      }
+      // Eigener Score einreichen (wenn eingeloggt)
+      if (_currentUser) {
+        html += `<div style="border-top:1px solid var(--dsn-border);padding-top:12px;margin-top:4px;">
+          <div style="font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--dsn-muted);margin-bottom:6px;">Score manuell eintragen</div>
+          <div class="dsn-submit-row">
+            <input class="dsn-inp" id="dsn-score-game-inp" placeholder="Spielname" style="font-size:12px;padding:6px 8px;"/>
+            <input class="dsn-inp" id="dsn-score-val-inp" type="number" placeholder="Score" style="font-size:12px;padding:6px 8px;"/>
+            <button class="dsn-btn" onclick="DSN.submitScore(document.getElementById('dsn-score-game-inp').value,parseInt(document.getElementById('dsn-score-val-inp').value))" style="width:auto;padding:6px 12px;font-size:11px;">➤</button>
+          </div>
+          <div class="dsn-msg" id="dsn-score-msg" style="margin-top:6px;"></div>
+        </div>`;
+      }
+      body.innerHTML = html;
+    } catch(e) {
+      body.innerHTML = '<div style="text-align:center;padding:20px;font-size:11px;color:var(--dsn-muted);">Scores-Tabelle fehlt. SQL-Setup ausführen.</div>';
+    }
+  }
+
+  /* ── Escape ── */
+  function _esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  /* ── DB Referenz ── */
+  let _db = null;
+  let _currentUser = null;
+
+  /* ── Storage-Event: Login/Logout auf anderen Tabs ── */
+  window.addEventListener('storage', e => {
+    if (e.key === SESSION_KEY) {
+      const s = e.newValue ? JSON.parse(e.newValue) : null;
+      _currentUser = s;
+      s ? _onLogin(s) : _onLogout();
+    }
+    if (e.key === 'dsn_logout_signal' && e.newValue) { _currentUser = null; _onLogout(); }
+    if (e.key === THEME_KEY && e.newValue) { applyTheme(e.newValue); updateThemeBtn(); }
+  });
+
+  /* ── PUBLIC API ══════════════════════════════════ */
+  window.DSN = {
+    /* Wird vom Spiel aufgerufen um den aktuellen Nutzer zu bekommen */
+    getUser: () => _currentUser,
+    getSession,
+
+    /* Score einreichen — aufrufen wenn Spiel endet */
+    submitScore: async (gameName, score) => {
+      if (!_currentUser || !gameName || isNaN(score)) {
+        console.warn('[DSN] submitScore: Nicht eingeloggt oder ungültige Parameter');
+        return { ok: false, reason: 'not_logged_in' };
+      }
+      try {
+        const { error } = await _db.from('dsn_scores').insert({
+          username:  _currentUser.username,
+          user_id:   _currentUser.id,
+          game_name: gameName,
+          score:     Math.round(score)
+        });
+        if (error) throw error;
+        // Score-Panel refreshen falls offen
+        if (openPanel === 'score') _loadScores();
+        return { ok: true };
+      } catch(e) { return { ok: false, reason: e.message }; }
+    },
+
+    /* Callbacks für das Spiel */
+    onLogin:  cb => { DSN._onLoginCallback  = cb; if (_currentUser) cb(_currentUser); },
+    onLogout: cb => { DSN._onLogoutCallback = cb; },
+
+    /* Theme */
+    _toggleTheme: () => { toggleTheme(); updateThemeBtn(); },
+
+    /* Intern */
+    _togglePanel, _closePanel, _login, _register, _logout,
+    _sendChat, _loadChat, _loadScores, _loadNotifs,
+    _switchAuthTab, _onLoginCallback: null, _onLogoutCallback: null,
+    _onLogin, _onLogout,
+  };
+
+  /* ── Init ── */
+  function init() {
+    injectStyles();
+    injectHTML();
+    applyTheme(getTheme());
+    updateThemeBtn();
+    loadSupabase(sb => {
+      _db = sb.createClient(SUPABASE_URL, SUPABASE_ANON);
+      // Session aus localStorage laden
+      const s = getSession();
+      if (s) { _currentUser = s; _onLogin(s); }
+      // Theme auch auf <html> anwenden
+      applyTheme(getTheme());
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
